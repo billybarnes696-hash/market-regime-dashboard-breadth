@@ -1,7 +1,27 @@
-streamlit>=1.37
-pandas>=2.2
-numpy>=1.26
-PyMuPDF>=1.24
-Pillow>=10.4
-pytesseract>=0.3.10
-plotly>=5.23
+# Core app
+streamlit==1.32.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Data + APIs
+yfinance==0.2.40
+requests==2.31.0
+
+# Visualization
+plotly==5.19.0
+
+# OCR / Image processing (for PNG workflow)
+pytesseract==0.3.10
+opencv-python==4.9.0.80
+Pillow==10.2.0
+numpy==1.26.4
+
+# PDF support (optional fallback)
+pdf2image==1.17.0
+
+# Quant / backtesting / Monte Carlo
+scipy==1.11.4
+statsmodels==0.14.1
+
+# Utilities
+python-dateutil==2.9.0.post0
