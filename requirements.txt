@@ -1,7 +1,7 @@
-streamlit
-pandas
-numpy
-yfinance
-plotly
-requests
-PyMuPDF
+plotly>=5.18.0      # charts / gauges
+yfinance>=0.2.36    # pull live data
+scipy>=1.10.0       # advanced scoring models
+
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
