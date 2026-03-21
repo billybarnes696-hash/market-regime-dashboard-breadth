@@ -1,307 +1,214 @@
-import math
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
-import pandas as pd
+# app.py
 import streamlit as st
+import pandas as pd
+import numpy as np
+import time
+import os
+import altair as alt
+from datetime import date, timedelta
 
-
-st.set_page_config(page_title="Breadth Traffic Light", layout="wide")
-
-
-# -----------------------------
-# Helper models
-# -----------------------------
-@dataclass
-class MetricInput:
-    name: str
-    value: float
-    confidence: str
-
-
-CONFIDENCE_MAP = {
-    "High": 0,
-    "Medium": 1,
-    "Low": 2,
-    "Unresolved": 3,
-}
-
-
-def is_low_quality(confidence: str) -> bool:
-    return CONFIDENCE_MAP.get(confidence, 3) >= 2
-
-
-# -----------------------------
-# Scoring logic
-# -----------------------------
-def classify_bpspx_zone(bpspx_pb: float) -> str:
-    if bpspx_pb < 0.10:
-        return "Capitulation"
-    if bpspx_pb < 0.20:
-        return "Repair"
-    if bpspx_pb < 0.30:
-        return "Confirmation"
-    return "Strong Confirmation"
-
-
-def score_traffic_light(inputs: Dict[str, float], confidence_flags: Dict[str, str]) -> Tuple[str, int, List[str], List[str], List[str]]:
-    """
-    Returns:
-        light, points, reasons, upgrades, downgrades
-    """
-    reasons: List[str] = []
-    upgrades: List[str] = []
-    downgrades: List[str] = []
-
-    core_conf_keys = [
-        "bpspx_pb_conf",
-        "nymo_conf",
-        "rsp_pb_conf",
-        "spxa50r_pb_conf",
-        "oexa50r_pb_conf",
-    ]
-    low_quality_count = sum(is_low_quality(confidence_flags[k]) for k in core_conf_keys)
-
-    # Fail-fast quality override
-    if low_quality_count > 1:
-        reasons.append("More than 20% of core inputs are low-confidence or unresolved.")
-        downgrades.append("Improve data quality before taking risk.")
-        return "🔴 RED", 0, reasons, upgrades, downgrades
-
-    points = 0
-
-    # 1) BPSPX %B
-    if inputs["bpspx_pb"] > 0.20:
-        points += 1
-        reasons.append(f"BPSPX %B is confirming at {inputs['bpspx_pb']:.2f}.")
-    else:
-        reasons.append(f"BPSPX %B remains in the {classify_bpspx_zone(inputs['bpspx_pb']).lower()} zone at {inputs['bpspx_pb']:.2f}.")
-        upgrades.append("BPSPX %B > 0.20")
-        if inputs["bpspx_pb"] < 0.10:
-            downgrades.append("BPSPX %B < 0.10 deepens capitulation risk.")
-
-    # 2) NYMO
-    if inputs["nymo"] > -20:
-        points += 1
-        reasons.append(f"NYMO has improved to {inputs['nymo']:.2f}, above the -20 repair threshold.")
-    else:
-        reasons.append(f"NYMO is still weak at {inputs['nymo']:.2f}.")
-        upgrades.append("NYMO > -20")
-        if inputs["nymo"] < -40:
-            downgrades.append("NYMO < -40 would reinforce a defensive posture.")
-
-    # 3) RSP %B
-    if inputs["rsp_pb"] > 0.20:
-        points += 1
-        reasons.append(f"RSP %B is constructive at {inputs['rsp_pb']:.2f}.")
-    else:
-        reasons.append(f"RSP %B is not yet confirming at {inputs['rsp_pb']:.2f}.")
-        upgrades.append("RSP %B > 0.20")
-        downgrades.append("RSP price/quality deterioration can invalidate probe setups.")
-
-    # 4) SPXA50R %B
-    if inputs["spxa50r_pb"] > 0.20:
-        points += 1
-        reasons.append(f"SPXA50R %B confirms improving breadth depth at {inputs['spxa50r_pb']:.2f}.")
-    else:
-        reasons.append(f"SPXA50R %B remains soft at {inputs['spxa50r_pb']:.2f}.")
-        upgrades.append("SPXA50R %B > 0.20")
-
-    # 5) OEXA50R %B
-    if inputs["oexa50r_pb"] > 0.20:
-        points += 1
-        reasons.append(f"OEXA50R %B confirms improving large-cap breadth depth at {inputs['oexa50r_pb']:.2f}.")
-    else:
-        reasons.append(f"OEXA50R %B remains soft at {inputs['oexa50r_pb']:.2f}.")
-        upgrades.append("OEXA50R %B > 0.20")
-
-    # 6) VXX behavior
-    if not inputs["vxx_expanding"]:
-        points += 1
-        reasons.append("VXX is stable/down, so volatility is not actively fighting the setup.")
-    else:
-        reasons.append("VXX is expanding, which is a headwind for long entries.")
-        downgrades.append("VXX rolling higher keeps risk elevated.")
-
-    # 7) Relative strength
-    if inputs["rsp_spy_flat_to_up"]:
-        points += 1
-        reasons.append("RSP:SPY is flat to rising, which avoids a leadership penalty.")
-    else:
-        reasons.append("RSP:SPY is falling, so equal-weight leadership is not confirmed.")
-        downgrades.append("Falling RSP:SPY weakens long conviction.")
-
-    # Light mapping
-    if points <= 2:
-        light = "🔴 RED"
-    elif points <= 4:
-        light = "🟡 YELLOW"
-    else:
-        light = "🟢 GREEN"
-
-    # Override rules
-    if light == "🟢 GREEN" and inputs["bpspx_pb"] <= 0.20:
-        light = "🟡 YELLOW"
-        reasons.append("Green downgraded to Yellow because participation has not fully confirmed.")
-
-    if inputs["bpspx_pb"] < 0.10:
-        light = "🔴 RED"
-        reasons.append("Forced Red override due to BPSPX %B < 0.10.")
-
-    return light, points, reasons, upgrades, downgrades
-
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("🚦 Breadth Traffic Light Dashboard")
-st.caption("A fail-fast breadth model for RSP / URSP decision support")
-
-with st.sidebar:
-    st.header("Input Values")
-
-    st.subheader("Core Breadth")
-    bpspx_pb = st.number_input("BPSPX %B", min_value=-1.0, max_value=2.0, value=0.15, step=0.01, format="%.2f")
-    nymo = st.number_input("NYMO", min_value=-200.0, max_value=200.0, value=-31.50, step=0.50, format="%.2f")
-    rsp_pb = st.number_input("RSP %B", min_value=-1.0, max_value=2.0, value=0.22, step=0.01, format="%.2f")
-    spxa50r_pb = st.number_input("SPXA50R %B", min_value=-1.0, max_value=2.0, value=0.16, step=0.01, format="%.2f")
-    oexa50r_pb = st.number_input("OEXA50R %B", min_value=-1.0, max_value=2.0, value=0.25, step=0.01, format="%.2f")
-
-    st.subheader("Filters")
-    vxx_expanding = st.checkbox("VXX expanding / rising sharply", value=False)
-    rsp_spy_flat_to_up = st.checkbox("RSP:SPY flat to rising", value=True)
-
-    st.subheader("Confidence")
-    conf_options = ["High", "Medium", "Low", "Unresolved"]
-    bpspx_pb_conf = st.selectbox("BPSPX confidence", conf_options, index=0)
-    nymo_conf = st.selectbox("NYMO confidence", conf_options, index=0)
-    rsp_pb_conf = st.selectbox("RSP %B confidence", conf_options, index=0)
-    spxa50r_pb_conf = st.selectbox("SPXA50R %B confidence", conf_options, index=0)
-    oexa50r_pb_conf = st.selectbox("OEXA50R %B confidence", conf_options, index=0)
-
-    st.subheader("Optional Prices")
-    rsp_price = st.number_input("RSP price", min_value=0.0, value=196.05, step=0.05, format="%.2f")
-    rsp_trigger = st.number_input("RSP trigger level", min_value=0.0, value=195.50, step=0.05, format="%.2f")
-
-inputs = {
-    "bpspx_pb": bpspx_pb,
-    "nymo": nymo,
-    "rsp_pb": rsp_pb,
-    "spxa50r_pb": spxa50r_pb,
-    "oexa50r_pb": oexa50r_pb,
-    "vxx_expanding": vxx_expanding,
-    "rsp_spy_flat_to_up": rsp_spy_flat_to_up,
-    "rsp_price": rsp_price,
-    "rsp_trigger": rsp_trigger,
-}
-
-confidence_flags = {
-    "bpspx_pb_conf": bpspx_pb_conf,
-    "nymo_conf": nymo_conf,
-    "rsp_pb_conf": rsp_pb_conf,
-    "spxa50r_pb_conf": spxa50r_pb_conf,
-    "oexa50r_pb_conf": oexa50r_pb_conf,
-}
-
-light, points, reasons, upgrades, downgrades = score_traffic_light(inputs, confidence_flags)
-
-# -----------------------------
-# Summary cards
-# -----------------------------
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Traffic Light", light)
-with col2:
-    st.metric("Score", f"{points}/7")
-with col3:
-    if rsp_price >= rsp_trigger:
-        st.metric("Price vs Trigger", f"{rsp_price:.2f} ≥ {rsp_trigger:.2f}")
-    else:
-        st.metric("Price vs Trigger", f"{rsp_price:.2f} < {rsp_trigger:.2f}")
-
-# -----------------------------
-# Narrative section
-# -----------------------------
-st.subheader("Decision Summary")
-if light == "🟢 GREEN":
-    st.success("Go regime: breadth and price are broadly aligned.")
-    action_text = "RSP 40–60%; URSP 0–25% only if confirmation is broad, not just price-led."
-elif light == "🟡 YELLOW":
-    st.warning("Probe regime: some improvement, but breadth is not fully confirmed.")
-    action_text = "RSP 10–15% max; no URSP; require quick follow-through or exit."
-else:
-    st.error("No-trade / defensive regime: internals are weak or data quality is insufficient.")
-    action_text = "No new longs; hold cash or hedges; wait for repair."
-
-st.write(f"**Suggested action:** {action_text}")
-
-# -----------------------------
-# Diagnostics
-# -----------------------------
-col_a, col_b = st.columns(2)
-with col_a:
-    st.subheader("Why")
-    for reason in reasons:
-        st.write(f"- {reason}")
-
-with col_b:
-    st.subheader("Upgrade / Downgrade Triggers")
-    if upgrades:
-        st.write("**Upgrade to stronger stance if:**")
-        for item in upgrades[:5]:
-            st.write(f"- {item}")
-    if downgrades:
-        st.write("**Downgrade risk if:**")
-        for item in downgrades[:5]:
-            st.write(f"- {item}")
-
-# -----------------------------
-# Rule grid
-# -----------------------------
-st.subheader("Rule Grid")
-rule_df = pd.DataFrame(
-    [
-        ["BPSPX %B", bpspx_pb, "> 0.20", "Pass" if bpspx_pb > 0.20 else "Fail", bpspx_pb_conf],
-        ["NYMO", nymo, "> -20", "Pass" if nymo > -20 else "Fail", nymo_conf],
-        ["RSP %B", rsp_pb, "> 0.20", "Pass" if rsp_pb > 0.20 else "Fail", rsp_pb_conf],
-        ["SPXA50R %B", spxa50r_pb, "> 0.20", "Pass" if spxa50r_pb > 0.20 else "Fail", spxa50r_pb_conf],
-        ["OEXA50R %B", oexa50r_pb, "> 0.20", "Pass" if oexa50r_pb > 0.20 else "Fail", oexa50r_pb_conf],
-        ["VXX", "Stable/Down" if not vxx_expanding else "Expanding", "Stable/Down", "Pass" if not vxx_expanding else "Fail", "n/a"],
-        ["RSP:SPY", "Flat/Up" if rsp_spy_flat_to_up else "Down", "Flat/Up", "Pass" if rsp_spy_flat_to_up else "Fail", "n/a"],
-    ],
-    columns=["Factor", "Current", "Threshold", "Status", "Confidence"],
+# Import helpers from your repo script
+# Ensure build_liquid_optionable_universe.py exposes these functions or adjust names accordingly
+from build_liquid_optionable_universe import (
+    SEED_SYMBOLS,
+    extract_symbol_df,
+    tsi,
+    cci,
+    backtest_symbol,
 )
-st.dataframe(rule_df, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# Self-audit
-# -----------------------------
-st.subheader("Self-Audit")
-core_drivers = [
-    ("BPSPX %B", bpspx_pb, bpspx_pb_conf),
-    ("NYMO", nymo, nymo_conf),
-    ("RSP %B", rsp_pb, rsp_pb_conf),
+st.set_page_config(page_title="TSI + CCI Dashboard", layout="wide")
+st.title("TSI + CCI Exhaustion Dashboard")
+
+# Defaults and checkpoint
+DEFAULT_TICKERS = SEED_SYMBOLS if "SEED_SYMBOLS" in globals() else [
+    "SPY","QQQ","IWM","DIA","XLF","XLK","SMH","XLE","TLT","GLD",
+    "AAPL","MSFT","NVDA","AMZN","META","TSLA","AMD","INTC","MU","PLTR"
 ]
+CHECKPOINT_FILE = "liquidity_checkpoint.csv"
 
-st.write("**Top 3 drivers**")
-for name, value, conf in core_drivers:
-    st.write(f"- {name}: {value} ({conf})")
+# -----------------------------
+# Helper utilities
+# -----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data_yf(tickers, start_date, end_date):
+    import yfinance as yf
+    raw = yf.download(
+        tickers=tickers,
+        start=start_date,
+        end=end_date,
+        interval="1d",
+        auto_adjust=False,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+    return raw
 
-st.write("**Invalidation test**")
-if light == "🟡 YELLOW":
-    st.write("- This thesis is invalidated if BPSPX %B falls below 0.10 or price loses the session support/trigger structure.")
-    st.write("- This thesis upgrades if BPSPX %B > 0.20 and NYMO > -20.")
-elif light == "🟢 GREEN":
-    st.write("- This thesis is invalidated if participation falls back under confirmation and volatility expands.")
+@st.cache_data(ttl=3600)
+def cached_backtest(symbol, raw, tsi_params, cci_len, tsi_pct_threshold, cci_state):
+    df = extract_symbol_df(raw, symbol)
+    return backtest_symbol(df, tsi_params, cci_len, tsi_pct_threshold, cci_state)
+
+def safe_float(x):
+    return float(x) if pd.notna(x) else np.nan
+
+def make_altair_price_chart(df, symbol):
+    dfc = df.reset_index().rename(columns={"index": "Date"})
+    base = alt.Chart(dfc).encode(x="Date:T")
+    price = base.mark_line(color="#1f77b4").encode(y=alt.Y("Close:Q", title="Price"))
+    tsi_line = base.mark_line(color="#ff7f0e").encode(y=alt.Y("TSI:Q", title="TSI"))
+    tsi_signal = base.mark_line(color="#2ca02c").encode(y="TSI_SIGNAL:Q")
+    cci_line = base.mark_line(color="#9467bd").encode(y="CCI:Q")
+    price_chart = price.properties(height=300, width=700, title=f"{symbol} Price")
+    indicator_chart = alt.layer(tsi_line, tsi_signal, cci_line).properties(height=200, width=700, title=f"{symbol} Indicators")
+    return price_chart & indicator_chart
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+with st.sidebar:
+    st.header("Inputs")
+    tickers_text = st.text_area("Tickers (comma-separated)", value=",".join(DEFAULT_TICKERS), height=150)
+    tickers = [x.strip().upper() for x in tickers_text.split(",") if x.strip()]
+
+    st.subheader("TSI")
+    tsi_choice = st.selectbox("TSI combo", options=["4,2,4", "6,3,6", "7,4,7"], index=0)
+    tsi_params = tuple(int(x) for x in tsi_choice.split(","))
+
+    st.subheader("CCI")
+    cci_len = st.selectbox("CCI length", options=[5, 7, 10, 14], index=1)
+    cci_state = st.selectbox("CCI state", options=["down_1d", "down_2d", "up_1d", "any"], index=0)
+
+    st.subheader("Signal rule")
+    tsi_pct_threshold = st.slider("TSI percentile threshold", 85, 99, 97)
+    years = st.slider("Years of history", 2, 10, 5)
+    min_signals = st.slider("Minimum historical signals", 3, 50, 8)
+
+    st.subheader("Run options")
+    batch_size = st.slider("Batch size for downloads", 1, 25, 10)
+    delay = st.slider("Delay between symbols (s)", 0, 5, 1)
+    run_btn = st.button("Run dashboard", type="primary")
+    if os.path.exists(CHECKPOINT_FILE):
+        if st.button("Load checkpoint"):
+            df_ck = pd.read_csv(CHECKPOINT_FILE)
+            st.sidebar.write(f"Loaded checkpoint with {len(df_ck)} rows")
+        if st.button("Clear checkpoint"):
+            os.remove(CHECKPOINT_FILE)
+            st.sidebar.success("Checkpoint removed")
+    else:
+        df_ck = None
+
+# -----------------------------
+# Main run logic
+# -----------------------------
+if run_btn:
+    end_date = date.today() + timedelta(days=1)
+    start_date = date.today() - timedelta(days=int(365.25 * years))
+
+    # Download in batches to avoid memory spikes
+    results_rows = []
+    charts = {}
+    total = len(tickers)
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i in range(0, total, batch_size):
+        batch = tickers[i : i + batch_size]
+        status.info(f"Downloading batch {i//batch_size + 1} of {((total-1)//batch_size)+1}")
+        raw_batch = load_data_yf(batch, start_date, end_date)
+        for j, sym in enumerate(batch, start=i+1):
+            status.text(f"Processing {sym} ({j}/{total})")
+            try:
+                df = extract_symbol_df(raw_batch, sym)
+                res = backtest_symbol(
+                    df=df,
+                    tsi_params=tsi_params,
+                    cci_len=cci_len,
+                    tsi_pct_threshold=tsi_pct_threshold,
+                    cci_state=cci_state,
+                )
+            except Exception as e:
+                res = {"symbol": sym, "error": str(e)}
+            if res is None:
+                continue
+
+            # Ensure consistent types and safe floats
+            res_safe = {}
+            for k, v in res.items():
+                if k in ("latest_tsi", "latest_tsi_pct", "latest_cci", "latest_cci_delta", "avg_1d_return", "avg_2d_return", "next_day_red_pct", "two_day_red_pct"):
+                    res_safe[k] = safe_float(v)
+                else:
+                    res_safe[k] = v
+
+            # Save chart df separately
+            chart_df = res_safe.pop("chart_df", None)
+            if chart_df is not None and not chart_df.empty:
+                charts[sym] = chart_df
+
+            row = {"symbol": sym, **res_safe}
+            results_rows.append(row)
+
+            # Append to checkpoint immediately
+            df_row = pd.DataFrame([row])
+            if os.path.exists(CHECKPOINT_FILE):
+                df_row.to_csv(CHECKPOINT_FILE, mode='a', header=False, index=False)
+            else:
+                df_row.to_csv(CHECKPOINT_FILE, index=False)
+
+            progress.progress(int(j/total*100))
+            time.sleep(delay)
+
+    # Build results DataFrame
+    if not results_rows:
+        st.warning("No usable data returned. Try fewer tickers or rerun.")
+    else:
+        results = pd.DataFrame(results_rows)
+        results = results[results["signals"].fillna(0) >= min_signals].copy()
+
+        if results.empty:
+            st.warning("No symbols met the minimum signal count. Lower the minimum signals filter.")
+        else:
+            # Compute score and sort
+            results["score"] = (
+                results["next_day_red_pct"].fillna(0) * 0.55
+                + (-results["avg_1d_return"].fillna(0)) * 15 * 0.25
+                + results["signals"].clip(upper=50) * 0.20
+            )
+            results = results.sort_values(
+                ["latest_signal", "score", "next_day_red_pct", "signals"],
+                ascending=[False, False, False, False],
+            ).reset_index(drop=True)
+
+            # Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Symbols passing", len(results))
+            c2.metric("Live signals now", int(results["latest_signal"].sum()))
+            c3.metric("Best next-day red %", f"{results['next_day_red_pct'].max():.1f}%")
+            c4.metric("Best avg 1D return", f"{results['avg_1d_return'].max():.2f}%")
+
+            st.subheader("Ranked results")
+            display_cols = [
+                "symbol", "latest_signal", "latest_tsi", "latest_tsi_pct", "latest_cci",
+                "latest_cci_delta", "signals", "next_day_red_pct", "two_day_red_pct",
+                "avg_1d_return", "avg_2d_return", "score"
+            ]
+            st.dataframe(results[display_cols].fillna(""), use_container_width=True, hide_index=True)
+
+            st.subheader("Chart review")
+            selected = st.selectbox("Select symbol", options=results["symbol"].tolist())
+            chart_df = charts.get(selected)
+            if chart_df is not None:
+                chart_df = chart_df.copy()
+                chart_df["TSI"], chart_df["TSI_SIGNAL"] = tsi(chart_df["Close"], *tsi_params)
+                chart_df["CCI"] = cci(chart_df["High"], chart_df["Low"], chart_df["Close"], cci_len)
+                st.altair_chart(make_altair_price_chart(chart_df, selected), use_container_width=True)
+
+            # Downloads
+            st.download_button("Download CSV", results.to_csv(index=False), "liquidity_snapshot.csv")
+            try:
+                st.download_button("Download Parquet", results.to_parquet(index=False), "liquidity_snapshot.parquet")
+            except Exception:
+                pass
 else:
-    st.write("- This thesis is invalidated if participation and momentum suddenly confirm together, which would shift the model out of Red.")
-
-st.write("**Probability framing**")
-if light == "🟢 GREEN":
-    st.write("- Estimated probability of constructive long conditions: High (>70%).")
-elif light == "🟡 YELLOW":
-    st.write("- Estimated probability of durable follow-through: Moderate (50–70%), pending confirmation.")
-else:
-    st.write("- Estimated probability of attractive long conditions: Low (<50%).")
-
-st.caption("Note: This dashboard is a rules-based support tool, not investment advice.")
+    st.info("Choose your tickers and settings in the sidebar, then click 'Run dashboard'.")
